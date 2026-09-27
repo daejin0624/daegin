@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>krflow 운영 화면</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1a1d21;--muted:#666;--line:#e3e6ea;--ok:#1a7f37;--warn:#b7791f;--err:#c0392b;--accent:#2457c5}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#111418;--card:#1a1f26;--fg:#e6e8eb;--muted:#9aa3ad;--line:#2b323b}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Malgun Gothic",sans-serif;padding:16px}
+h1{font-size:18px;margin:0 0 8px}h2{font-size:14px;margin:0 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.err{color:var(--err)}
+table{border-collapse:collapse;width:100%;font-size:12.5px}th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}.num{text-align:right;font-variant-numeric:tabular-nums}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer}button.danger{background:var(--err)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px}.kv b{color:var(--muted);font-weight:500}
+.banner{padding:10px 12px;border-radius:8px;margin-bottom:12px;font-weight:600}
+.banner.synthetic{background:#fff3cd;color:#6b4e00}.banner.paper{background:#e3f0ff;color:#0b3d91}.banner.kis_vts{background:#e6f7ec;color:#0f5132}.banner.backtest{background:#eee;color:#333}
+small{color:var(--muted)}
+</style></head><body>
+<h1>krflow 운영 화면 <small id="now"></small></h1>
+<div id="banner" class="banner"></div>
+<div class="grid">
+<div class="card"><h2>운영 상태</h2><div class="kv" id="ops"></div>
+<div style="margin-top:8px"><button class="danger" onclick="halt()">신규 주문 수동 중단</button> <button onclick="resume()">재개</button></div></div>
+<div class="card"><h2>자산</h2><div class="kv" id="acct"></div></div>
+<div class="card"><h2>위험 한도 · 전략</h2><div class="kv" id="limits"></div></div>
+<div class="card"><h2>데이터 수집 상태</h2><div id="data"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>조치 필요</h2><div id="needs"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>보유 종목</h2><div id="pos"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>매매 후보 (선정·제외 근거)</h2><div id="cands"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>주문·체결·취소 내역</h2><div id="orders"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>청산 내역 (거래별 수익률)</h2><div id="closed"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>전략 검증 결과 (저장된 결과 파일)</h2><div id="results"></div></div>
+<div class="card" style="grid-column:1/-1"><h2>이벤트</h2><div id="events"></div></div>
+</div>
+<script>
+const f=(n,d=0)=>n==null?'-':Number(n).toLocaleString('ko-KR',{maximumFractionDigits:d,minimumFractionDigits:d});
+const pct=n=>n==null?'-':(n*100).toFixed(2)+'%';
+const kv=o=>Object.entries(o).map(([k,v])=>`<b>${k}</b><span>${v}</span>`).join('');
+const tbl=(rows,cols)=>rows.length?`<table><tr>${cols.map(c=>`<th>${c[0]}</th>`).join('')}</tr>${rows.map(r=>`<tr>${cols.map(c=>`<td class="${c[2]||''}">${c[1](r)}</td>`).join('')}</tr>`).join('')}</table>`:'<small>없음</small>';
+async function post(p,b){await fetch(p,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b||{})});load();}
+function halt(){const r=prompt('중단 사유');if(r!==null)post('/api/halt',{reason:r});}
+function resume(){post('/api/resume');}
+async function load(){
+ const s=await (await fetch('/api/status')).json();
+ document.getElementById('now').textContent='갱신 '+s.now;
+ const b=document.getElementById('banner');b.className='banner '+s.mode;b.textContent=`실행 모드: ${s.mode_label} — 실계좌 주문 차단됨. `+(s.mode==='synthetic'?'이 화면의 수치는 합성 데이터이며 실제 투자 성과가 아닙니다.':s.mode==='kis_vts'?'증권사 모의투자 결과. 연동 기능은 미검증 상태입니다.':'내부 시뮬레이션 결과입니다.');
+ const h=s.halt;
+ document.getElementById('ops').innerHTML=kv({'중단 상태':h.halted?`<span class="err">중단 (${h.kind})</span>`:'<span class="ok">정상</span>','중단 사유':h.reason||'-','재개 가능':h.halted?(h.resumable?'예':'아니오(수동 조치 필요)'):'-','중단 시각':h.since||'-','미해결 주문':s.open_orders.length,'결과 불명 주문':`<span class="${s.unknown_orders.length?'err':''}">${s.unknown_orders.length}</span>`,'잔고 불일치':`<span class="${s.reconciliations.length?'err':''}">${s.reconciliations.length}</span>`,'브로커 기능 상태':Object.entries(s.broker_features).map(([k,v])=>`${k}:${v}`).join(', ')||'-'});
+ const a=s.account;
+ document.getElementById('acct').innerHTML=kv({'현금(예수금)':f(a.cash),'주문가능금액':f(a.orderable),'평가금액':f(a.market_value),'평가자산':f(a.equity),'실현손익':`<span class="${a.realized_pnl<0?'err':'ok'}">${f(a.realized_pnl)}</span>`,'미실현손익':`<span class="${a.unrealized_pnl<0?'err':'ok'}">${f(a.unrealized_pnl)}</span>`,'낙폭(고점대비)':pct(a.drawdown),'계좌 기준':(a.asof||'-')+(a.verified_live?' (증권사 조회)':' (내부 시뮬레이션)')});
+ document.getElementById('limits').innerHTML=kv({'초기자금':f(s.risk_limits.initial_cash),'건별 매수':f(s.risk_limits.budget_per_trade),'일별 매수':f(s.risk_limits.max_daily_buy),'최대 보유':s.risk_limits.max_positions,'손실 한도':pct(s.risk_limits.max_loss_rate),'전략':`기관 ${s.strategy.inst_streak_days}일 연속 + 외국인 ${s.strategy.require_foreign?'필수':'무관'} / 보유 ${s.strategy.hold_days}일 / 순위 ${s.strategy.rank_by}`});
+ const d=s.data;
+ document.getElementById('data').innerHTML=kv({'마지막 데이터 일자':d.last_date||'-','마지막 EOD 처리':d.last_eod?`${d.last_eod.date} (${d.last_eod.at})`:'-','차단 데이터 이슈':`<span class="${d.open_issue_count?'warn':''}">${d.open_issue_count}</span>`})+tbl(d.collections,[['소스',r=>r.source],['데이터',r=>r.dataset],['기간',r=>`${r.date_from}~${r.date_to}`],['요청/수신',r=>`${r.requested}/${r.received}`],['상태',r=>`<span class="${r.status==='ok'?'ok':'err'}">${r.status}</span>`],['메시지',r=>r.message||''],['수집시각',r=>r.collected_at]])+(d.open_issues.length?'<details><summary>이슈 목록</summary>'+tbl(d.open_issues,[['종목',r=>r.code],['일자',r=>r.date],['종류',r=>r.kind],['내용',r=>r.detail],['차단',r=>r.blocks_trading?'예':'아니오']])+'</details>':'');
+ document.getElementById('needs').innerHTML=tbl(s.needs_action.concat(s.reconciliations.map(r=>({at:r.at,category:'reconcile',message:`${r.code} 로컬 ${r.local_value} vs 증권사 ${r.broker_value}`,rec:r.id}))),[['시각',r=>r.at],['분류',r=>r.category],['내용',r=>r.message],['처리',r=>r.rec?`<button onclick="post('/api/resolve_reconciliation',{id:${r.rec},note:'수동 확인'})">확인 처리</button>`:`<button onclick="post('/api/resolve_event',{id:${r.id}})">확인</button>`]]);
+ document.getElementById('pos').innerHTML=tbl(s.positions,[['종목',r=>r.code],['수량',r=>f(r.qty),'num'],['매입가',r=>f(r.avg_price),'num'],['현재가',r=>f(r.last_price),'num'],['평가금액',r=>f(r.market_value),'num'],['미실현',r=>`<span class="${r.unrealized<0?'err':'ok'}">${f(r.unrealized)}</span>`,'num'],['매수일',r=>r.entry_date],['보유일수',r=>r.hold_days,'num'],['예정 청산일',r=>r.planned_exit_date],['상태',r=>r.exit_state==='holding'?'보유':r.exit_state==='exit_pending'?'청산 주문 중':'<span class="err">청산 불가(재시도)</span>']]);
+ document.getElementById('cands').innerHTML=`<small>신호일 ${s.candidates.date||'-'} 기준 (다음 거래일 시가 매수 대상)</small>`+tbl(s.candidates.items,[['순위',r=>r.rank??'-'],['종목',r=>r.code],['선정',r=>r.selected?'<span class="ok">선정</span>':'<span class="warn">제외</span>'],['점수',r=>r.score==null?'-':Number(r.score).toFixed(4)],['근거',r=>r.reasons.join('<br>')],['제외 사유',r=>r.exclusion||'']]);
+ document.getElementById('orders').innerHTML=tbl(s.orders,[['예정',r=>r.scheduled_for],['종목',r=>r.code],['방향',r=>r.side],['수량',r=>f(r.qty),'num'],['체결',r=>f(r.filled_qty),'num'],['체결가',r=>f(r.avg_price),'num'],['상태',r=>`<span class="${r.state==='filled'?'ok':r.state==='unknown'||r.state==='rejected'?'err':'warn'}">${r.state}</span>`],['전송',r=>r.submitted_at||'-'],['체결시각',r=>r.filled_at||'-'],['근거',r=>r.reason||''],['오류',r=>r.error||'']]);
+ document.getElementById('closed').innerHTML=tbl(s.closed,[['종목',r=>r.code],['수량',r=>f(r.qty),'num'],['매수일',r=>r.entry_date],['매수가',r=>f(r.entry_price),'num'],['매도일',r=>r.exit_date],['매도가',r=>f(r.exit_price),'num'],['비용',r=>f(r.fees+r.tax),'num'],['손익',r=>`<span class="${r.pnl<0?'err':'ok'}">${f(r.pnl)}</span>`,'num'],['수익률',r=>pct(r.ret),'num'],['비고',r=>r.note||'']]);
+ document.getElementById('results').innerHTML=tbl(s.results,[['파일',r=>r.name],['구분',r=>({synthetic:'<span class="warn">합성 데이터</span>',real_backtest:'실제 데이터 백테스트',broker_paper:'<span class="ok">증권사 모의투자</span>',comparison:'비교 결과'})[r.data_kind]||r.data_kind],['기간',r=>r.period?r.period.join('~'):'-'],['총수익률',r=>r.summary?pct(r.summary.total_return):'-','num'],['MDD',r=>r.summary?pct(r.summary.max_drawdown):'-','num'],['거래',r=>r.summary?r.summary.trades:'-','num'],['승률',r=>r.summary?pct(r.summary.win_rate):'-','num']]);
+ document.getElementById('events').innerHTML=tbl(s.events,[['시각',r=>r.at],['수준',r=>`<span class="${r.level==='error'?'err':r.level==='warn'?'warn':''}">${r.level}</span>`],['분류',r=>r.category],['내용',r=>r.message]]);
+}
+load();setInterval(load,5000);
+</script></body></html>

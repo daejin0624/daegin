@@ -1,0 +1,9 @@
+{
+  "mode": "paper",
+  "db_path": "data/krflow.db",
+  "decision_time": "08:30",
+  "dashboard_port": 8765,
+  "costs": {"commission_rate": 0.00015, "sell_tax_rate": 0.0015, "slippage_rate": 0.001},
+  "strategy": {"inst_streak_days": 3, "require_foreign": true, "hold_days": 5, "rank_by": "inst_sum_ratio", "min_trading_value": 1000000000.0},
+  "risk": {"initial_cash": 10000000, "budget_per_trade": 1000000, "max_daily_buy": 3000000, "max_positions": 5, "max_loss_rate": 0.1}
+}
