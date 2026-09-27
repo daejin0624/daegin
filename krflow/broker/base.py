@@ -64,6 +64,15 @@ class AccountSnapshot:
     verified_live: bool                     # 실제 증권사 연동으로 얻은 값인지
 
 
+@dataclass
+class Quote:
+    code: str
+    ref_price: float | None      # 매수 기준가: 신호일(전일) 종가
+    halted: bool                 # 거래정지
+    asof: str
+    source: str
+
+
 class BrokerError(Exception):
     pass
 
@@ -80,6 +89,17 @@ class Broker:
     def query(self, order: Order) -> OrderUpdate: raise NotImplementedError
     def cancel(self, order: Order) -> OrderUpdate: raise NotImplementedError
     def account(self) -> AccountSnapshot: raise NotImplementedError
+    def quote(self, code: str, date: str) -> Quote:
+        """주문 직전 기준가와 거래정지 여부. 당일 시가는 주문 시점에 알 수 없으므로 쓰지 않는다."""
+        raise NotImplementedError
     def feature_status(self) -> dict[str, str]:
         """기능별 검증 상태: verified | unverified | unsupported"""
         return {}
+
+
+def tick_floor(price: float) -> float:
+    """KRX 호가단위(2023년 개편 기준)로 내림."""
+    for bound, tick in ((2_000, 1), (5_000, 5), (20_000, 10), (50_000, 50), (200_000, 100), (500_000, 500)):
+        if price < bound:
+            return float(int(price // tick) * tick)
+    return float(int(price // 1_000) * 1_000)

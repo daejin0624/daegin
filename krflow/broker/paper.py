@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from ..config import CostModel
 from ..data.store import MarketStore
-from .base import Broker, Order, OrderUpdate, OrderState, AccountSnapshot, BrokerTimeout, BrokerError
+from .base import Broker, Order, OrderUpdate, OrderState, AccountSnapshot, BrokerTimeout, BrokerError, Quote
 
 
 class PaperBroker(Broker):
@@ -31,6 +31,9 @@ class PaperBroker(Broker):
         px = self._price(o)
         if px is None:
             return OrderUpdate(OrderState.REJECTED, error="거래 불가(정지/시세 없음)", broker_order_id=f"P{o.client_order_id[:8]}")
+        bid = f"P{o.client_order_id[:8]}"
+        if o.order_type == "limit" and o.side == "buy" and px > (o.limit_price or 0):
+            return OrderUpdate(OrderState.UNFILLED, broker_order_id=bid)   # 시가가 지정가 초과 -> 미체결
         slip = self.costs.slippage_rate
         px = px * (1 + slip) if o.side == "buy" else px * (1 - slip)
         if o.side == "buy":
@@ -69,7 +72,16 @@ class PaperBroker(Broker):
         return OrderUpdate(u.state, u.filled_qty, u.avg_price, u.broker_order_id, u.error)  # fills는 이미 반영됨
 
     def cancel(self, o: Order) -> OrderUpdate:
-        return OrderUpdate(OrderState.CANCELLED, broker_order_id=o.broker_order_id)
+        u = OrderUpdate(OrderState.CANCELLED, o.filled_qty, o.avg_price, broker_order_id=o.broker_order_id)
+        self._orders[o.client_order_id] = u
+        return u
+
+    def quote(self, code: str, date: str) -> Quote:
+        from ..data.models import now_iso
+        prev = self.store.con.execute("SELECT close FROM daily_bars WHERE code=? AND date<? AND close IS NOT NULL ORDER BY date DESC LIMIT 1", (code, date)).fetchone()
+        b = self.store.bar(code, date)
+        halted = b is None or bool(b["halted"])
+        return Quote(code, prev[0] if prev else None, halted, now_iso(), "paper(저장 시세)")
 
     def account(self) -> AccountSnapshot:
         from ..data.models import now_iso

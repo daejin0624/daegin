@@ -19,7 +19,7 @@ from ..data.models import now_iso
 from ..data.quality import run_quality_checks, blocked_codes
 from ..data.store import MarketStore
 from ..strategy.signal import compute_candidates, persist_candidates
-from ..broker.base import Broker, Order, OrderState
+from ..broker.base import Broker, Order, OrderState, tick_floor
 from ..broker.ledger import OrderLedger, make_client_order_id
 from ..risk.limits import RiskManager
 
@@ -72,8 +72,7 @@ class Runner:
             o = self.ledger.resolve(self.broker, o)
             if o.state != before:
                 notes.append(f"{o.code} {o.side} {before.value}->{o.state.value}")
-            if o.state == OrderState.FILLED:
-                self._apply_fill(o)
+            self._settle(o)
             if o.state == OrderState.UNKNOWN:
                 self.event("error", "order", f"{o.code} {o.side} 주문 결과 불명(id {o.client_order_id[:8]}) — 수동 확인 필요", needs_action=True)
         notes += self.reconcile()
@@ -83,6 +82,10 @@ class Runner:
         """프로그램 포지션 vs 증권사 잔고. 불일치는 reconciliations에 기록되고 신규매수를 막는다."""
         acct = self.broker.account()
         local = {r["code"]: r["qty"] for r in self.positions()}
+        # 아직 열린 주문의 체결분은 포지션에 반영 전이므로 기대 수량에 더한다(매수 +, 매도 -)
+        for o in self.ledger.open_orders():
+            if o.filled_qty:
+                local[o.code] = local.get(o.code, 0) + (o.filled_qty if o.side == "buy" else -o.filled_qty)
         notes = []
         for code in set(local) | set(acct.positions):
             lq, bq = local.get(code, 0), acct.positions.get(code, (0, 0))[0]
@@ -104,6 +107,11 @@ class Runner:
         self.con.commit()
 
     # ---- 체결 반영 ----
+    def _settle(self, o: Order) -> None:
+        """전량체결, 또는 부분체결 후 취소된 주문의 체결분을 포지션에 반영한다."""
+        if o.state == OrderState.FILLED or (o.state == OrderState.CANCELLED and o.filled_qty > 0):
+            self._apply_fill(o)
+
     def _apply_fill(self, o: Order) -> None:
         if o.intent == "entry":
             if self.con.execute("SELECT 1 FROM positions WHERE code=?", (o.code,)).fetchone():
@@ -114,7 +122,7 @@ class Runner:
                              (o.code, o.filled_qty, o.avg_price, date, exit_date, o.client_order_id))
         else:
             p = self.con.execute("SELECT * FROM positions WHERE code=?", (o.code,)).fetchone()
-            if p is None:
+            if p is None or self.con.execute("SELECT 1 FROM closed_positions WHERE exit_order_id=?", (o.client_order_id,)).fetchone():
                 return
             date = o.scheduled_for.split(" ")[0]
             c = self.s.costs
@@ -134,9 +142,8 @@ class Runner:
         o = self.ledger.submit(self.broker, o)
         if o.state in (OrderState.SUBMITTED, OrderState.UNFILLED, OrderState.PARTIAL):
             o = self.ledger.resolve(self.broker, o)   # 시장가는 곧바로 체결되는 경우가 많음
-        if o.state == OrderState.FILLED:
-            self._apply_fill(o)
-        elif o.state == OrderState.UNKNOWN:
+        self._settle(o)
+        if o.state == OrderState.UNKNOWN:
             self.event("error", "order", f"{o.code} {o.side} 결과 불명 — 다음 주기 조회로 해결 전 신규매수 차단", needs_action=True)
         elif o.state == OrderState.REJECTED:
             self.event("warn", "order", f"{o.code} {o.side} 거절: {o.error}")
@@ -185,23 +192,28 @@ class Runner:
             if r["code"] in blocked:
                 rep.blocked.append(f"{r['code']} 데이터 이슈: {blocked[r['code']]}")
                 continue
-            b = self.store.bar(r["code"], date)
-            ref_px = b["open"] if b and b["open"] and b["open_tradable"] else None
-            if ref_px is None:
-                rep.blocked.append(f"{r['code']} 매수일 시가 거래 불가/시세 없음")
+            try:
+                q = self.broker.quote(r["code"], date)
+            except Exception as e:
+                rep.blocked.append(f"{r['code']} 시세 조회 실패: {e}")
                 continue
-            qty, why = self.risk.buy_qty(ref_px * (1 + self.s.costs.slippage_rate), acct.get("orderable", 0), pending_amt, daily_bought, self.s.costs.commission_rate)
+            if q.halted or not q.ref_price:
+                rep.blocked.append(f"{r['code']} 거래정지 또는 기준가 없음")
+                continue
+            # 지정가 = 기준가(신호일 종가) x (1+한도). 장전 동시호가에서 시가가 이 이하이면 시가에 체결된다.
+            limit_px = tick_floor(q.ref_price * (1 + self.s.strategy.entry_limit_buffer))
+            qty, why = self.risk.buy_qty(limit_px, acct.get("orderable", 0), pending_amt, daily_bought, self.s.costs.commission_rate)
             if why:
                 rep.blocked.append(f"{r['code']} {why}")
                 continue
-            o = Order(make_client_order_id(self.s.mode.value, r["code"], "buy", "entry", f"{date} open"), r["code"], "buy", qty, "market", "entry",
-                      f"{date} open", limit_price=ref_px, reason=f"rank {r['rank']}: " + "; ".join(json.loads(r["reasons"])), signal_date=sig, rank=r["rank"])
+            o = Order(make_client_order_id(self.s.mode.value, r["code"], "buy", "entry", f"{date} open"), r["code"], "buy", qty, "limit", "entry",
+                      f"{date} open", limit_price=limit_px, reason=f"rank {r['rank']}: " + "; ".join(json.loads(r["reasons"])), signal_date=sig, rank=r["rank"])
             o = self._place(o)
             rep.actions.append(f"BUY {o.code} x{qty} -> {o.state.value}" + (f" @{o.avg_price:,.0f}" if o.avg_price else ""))
             if o.state not in (OrderState.REJECTED, OrderState.CANCELLED):
                 n_slots -= 1
-                daily_bought += ref_px * qty
-                pending_amt += ref_px * qty if o.state != OrderState.FILLED else 0
+                daily_bought += limit_px * qty
+                pending_amt += limit_px * qty if o.state != OrderState.FILLED else 0
                 held.add(o.code)
             if o.state == OrderState.UNKNOWN:
                 rep.blocked.append("결과 불명 주문 발생 — 이후 신규매수 중단")
@@ -215,7 +227,6 @@ class Runner:
             rep.blocked.append("이미 실행된 단계(재실행 방지)")
             return rep
         rep.actions += self.recover()
-        blocked = blocked_codes(self.con, date)
         acct_pos = self.broker.account()
         for p in self.positions():
             if p["planned_exit_date"] > date:
@@ -224,9 +235,13 @@ class Runner:
             if self.ledger.open_orders(code):
                 rep.blocked.append(f"{code} 미해결 주문 있어 청산 보류")
                 continue
-            b = self.store.bar(code, date)
-            if b is None or not b["close_tradable"] or code in blocked:
-                why = "거래정지" if (b is not None and b["halted"]) else ("시세 없음" if b is None else blocked.get(code, "종가 거래 불가"))
+            # 청산은 데이터 이슈로 막지 않는다(신규 매수만 차단). 거래정지일 때만 다음 거래일로 미룬다.
+            try:
+                q = self.broker.quote(code, date)
+                why = "거래정지" if q.halted else None
+            except Exception as e:
+                why = f"시세 조회 실패: {e}"
+            if why:
                 self.con.execute("UPDATE positions SET exit_state='exit_blocked' WHERE code=?", (code,))
                 self.con.commit()
                 self.event("warn", "exit", f"{code} 예정 청산일 {p['planned_exit_date']} 종가 매도 불가({why}) — 다음 거래일 재시도", needs_action=True)
@@ -239,14 +254,46 @@ class Runner:
                 self.event("error", "exit", f"{code} 매도가능수량 0 (보유 {p['qty']})", needs_action=True)
                 continue
             o = Order(make_client_order_id(self.s.mode.value, code, "sell", "exit", f"{date} close"), code, "sell", qty, "market", "exit",
-                      f"{date} close", limit_price=b["close"], reason=f"보유 {self.s.strategy.hold_days}거래일 종가 청산")
+                      f"{date} close", reason=f"보유 {self.s.strategy.hold_days}거래일 종가 청산")
             self.con.execute("UPDATE positions SET exit_state='exit_pending' WHERE code=?", (code,))
             self.con.commit()
             o = self._place(o)
+            if o.state == OrderState.REJECTED:
+                self.con.execute("UPDATE positions SET exit_state='exit_blocked' WHERE code=?", (code,))
+                self.con.commit()
             rep.actions.append(f"SELL {o.code} x{qty} -> {o.state.value}" + (f" @{o.avg_price:,.0f}" if o.avg_price else ""))
-        self.reconcile()
-        self._snapshot_equity(date)
         self._mark_done(date, "close")
+        return rep
+
+    def run_sync(self, date: str, phase: str) -> PhaseReport:
+        """동시호가 체결 뒤 실행. 체결을 조회해 반영하고, 남은 미체결은 취소한다.
+        phase='open': 시가 미체결 매수(갭 상승 등)를 취소. phase='close': 종가 미체결 매도를 취소하고 다음 거래일 재시도로 표시."""
+        name = f"sync_{phase}"
+        rep = PhaseReport(date, name, [], [])
+        if self._done(date, name):
+            rep.blocked.append("이미 실행된 단계(재실행 방지)")
+            return rep
+        rep.actions += self.recover()
+        intent = "entry" if phase == "open" else "exit"
+        for o in self.ledger.open_orders():
+            if o.intent != intent or not o.scheduled_for.startswith(date) or o.state == OrderState.UNKNOWN:
+                continue
+            try:
+                self.ledger.apply(o, self.broker.cancel(o))
+                o = self.ledger.resolve(self.broker, o)
+            except Exception as e:
+                rep.blocked.append(f"{o.code} 취소 실패: {e}")
+                self.event("error", "order", f"{o.code} 미체결 취소 실패: {e}", needs_action=True)
+                continue
+            self._settle(o)
+            what = "시가 미체결 매수 취소(지정가 초과 갭 또는 미체결)" if intent == "entry" else "종가 미체결 매도 취소 — 다음 거래일 재시도"
+            rep.actions.append(f"{o.code} {what} -> {o.state.value}, 체결 {o.filled_qty}/{o.qty}")
+            self.event("warn", "order", f"{o.code} {what}", needs_action=(intent == "exit"))
+            if intent == "exit":
+                self.con.execute("UPDATE positions SET exit_state='exit_blocked' WHERE code=?", (o.code,))
+                self.con.commit()
+        self.reconcile()
+        self._mark_done(date, name)
         return rep
 
     def run_eod(self, date: str) -> PhaseReport:
@@ -262,6 +309,7 @@ class Runner:
         cands = compute_candidates(self.store, date, self.s.strategy, f"{nxt} {self.s.decision_time}:00", blocked_codes(self.con, date))
         persist_candidates(self.store, cands, now_iso())
         rep.actions.append(f"후보 {sum(c.selected for c in cands)} 선정 / {sum(not c.selected for c in cands)} 제외")
+        self._snapshot_equity(date)
         self._set_state("last_eod", {"date": date, "at": now_iso()})
         self._mark_done(date, "eod")
         return rep
@@ -285,7 +333,7 @@ class Runner:
         """저장된 데이터로 날짜별 open→close→eod를 순서대로 실행 (페이퍼 브로커 전용)."""
         reps = []
         for d in [x for x in self.store.dates() if start <= x <= end]:
-            reps += [self.run_open(d), self.run_close(d), self.run_eod(d)]
+            reps += [self.run_open(d), self.run_sync(d, "open"), self.run_close(d), self.run_sync(d, "close"), self.run_eod(d)]
         return reps
 
 

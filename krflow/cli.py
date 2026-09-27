@@ -61,14 +61,18 @@ def cmd_import_csv(a):
 
 
 def cmd_collect_pykrx(a):
+    import os
     s = _settings(a)
     con = connect(s.db_path)
-    codes = a.codes.split(",")
-    r = pykrx_source.fetch(date.fromisoformat(a.start), date.fromisoformat(a.end), codes)
-    MarketStore(con).ingest(r)
-    print(f"[{r.status}] {r.message}; bars {len(r.bars)} flows {len(r.flows)} (어댑터 검증 상태: {'검증' if pykrx_source.VERIFIED else '미검증'})")
-    if r.bars:
-        print(f"품질 이슈 {len(run_quality_checks(con))}건")
+    if not (os.environ.get("KRX_ID") and os.environ.get("KRX_PW")):
+        print("경고: KRX_ID / KRX_PW 환경변수가 없습니다. pykrx 1.2.x는 KRX 로그인이 필요하며, 없으면 빈 결과(수집 실패)가 기록됩니다.")
+    cal = TradingCalendar.load(a.calendar)
+    summary = pykrx_source.collect_range(MarketStore(con), date.fromisoformat(a.start), date.fromisoformat(a.end), cal, pause=a.pause)
+    print(f"수집 요약: {summary} (어댑터 검증 상태: {'검증' if pykrx_source.VERIFIED else '미검증'})")
+    if summary["failed"] or summary["partial"]:
+        print("실패/부분 수집일이 있습니다. collection_log 또는 대시보드에서 확인 후 같은 명령으로 다시 실행하면 빠진 날만 받습니다.")
+    new = run_quality_checks(con)
+    print(f"품질 이슈 {len(new)}건")
 
 
 def cmd_quality(a):
@@ -136,7 +140,7 @@ def cmd_compare(a):
     print(f"저장: {p}")
 
 
-def _make_runner(s: Settings, con):
+def _make_runner(s: Settings, con, a):
     from .ops.runner import Runner
     if s.mode == RunMode.KIS_VTS:
         from .broker.kis import KISBroker
@@ -144,9 +148,14 @@ def _make_runner(s: Settings, con):
     else:
         from .broker.paper import PaperBroker
         broker = PaperBroker(MarketStore(con), s.costs, s.risk.initial_cash)
-    r = Runner(s, con, broker)
-    r._set_state("broker_features", broker.feature_status())
+    r = Runner(s, con, broker, TradingCalendar.load(a.calendar))
+    features = broker.feature_status()
+    for k, v in (r._state("kis_verification") or {}).items():
+        if k in features and s.mode == RunMode.KIS_VTS:
+            features[k] = v
+    r._set_state("broker_features", features)
     return r
+
 
 
 def cmd_paper(a):
@@ -154,7 +163,7 @@ def cmd_paper(a):
     if s.mode not in (RunMode.PAPER, RunMode.SYNTHETIC):
         s = Settings(**{**s.to_dict(), "mode": "paper"})
     con = connect(s.db_path)
-    r = _make_runner(s, con)
+    r = _make_runner(s, con, a)
     reps = r.simulate(a.start, a.end)
     for rep in reps:
         if rep.actions or (a.verbose and rep.blocked):
@@ -168,31 +177,61 @@ def cmd_paper(a):
 def cmd_phase(a):
     s = _settings(a)
     con = connect(s.db_path)
-    r = _make_runner(s, con)
+    r = _make_runner(s, con, a)
     d = a.date or date.today().isoformat()
-    rep = {"open": r.run_open, "close": r.run_close, "eod": r.run_eod}[a.phase](d)
+    rep = {"open": r.run_open, "close": r.run_close, "eod": r.run_eod,
+           "sync_open": lambda d: r.run_sync(d, "open"), "sync_close": lambda d: r.run_sync(d, "close")}[a.phase](d)
     print(json.dumps(rep.__dict__, ensure_ascii=False, indent=1))
 
 
+SCHEDULE = (   # (단계, 시각). 장전 동시호가 08:30~09:00, 종가 동시호가 15:20~15:30
+    ("open", "08:50"),        # 지정가 매수를 장전 동시호가에 제출 -> 09:00 시가로 체결
+    ("sync_open", "09:05"),   # 체결 반영, 미체결(갭 상승) 매수 취소
+    ("close", "15:21"),       # 시장가 매도를 종가 동시호가에 제출 -> 15:30 종가로 체결
+    ("sync_close", "15:40"),  # 체결 반영, 미체결 매도 취소 -> 다음 거래일 재시도
+    ("collect", "18:20"),     # 당일 시세·수급 수집 (pykrx, KRX 로그인 필요)
+    ("eod", "18:30"),         # 품질검사, 다음 거래일 후보 산출, 일별 평가
+)
+
+
 def cmd_serve(a):
-    """KIS 모의투자용 스케줄러 [미검증]. 거래일 09:01 open, 15:20 close(동시호가 전 시장가), 18:30 eod."""
+    """모의투자 스케줄러 [미검증]. 휴장일 달력(--calendar)을 반드시 지정할 것."""
     import time
     from datetime import datetime
     s = _settings(a)
     con = connect(s.db_path)
-    r = _make_runner(s, con)
-    cal = TradingCalendar.load(a.calendar)
+    r = _make_runner(s, con, a)
+    if not Path(a.calendar).exists():
+        print(f"경고: 휴장일 파일 {a.calendar} 없음. 설·추석·선거일 등 휴장일을 모르면 휴장일에 주문을 시도합니다(증권사에서 거절됨).")
     print(f"스케줄러 시작 (모드 {s.mode.value}, 실계좌 차단). Ctrl+C로 종료")
+    print("일정: " + ", ".join(f"{p} {t}" for p, t in SCHEDULE))
     while True:
         now = datetime.now()
         d = now.date()
-        if cal.is_trading_day(d):
+        ds = d.isoformat()
+        if r.cal.is_trading_day(d):
             hm = now.strftime("%H:%M")
-            for phase, t in (("open", "09:01"), ("close", "15:20"), ("eod", "18:30")):
-                if hm >= t and not r._done(d.isoformat(), phase):
-                    rep = getattr(r, f"run_{phase}")(d.isoformat())
+            for phase, t in SCHEDULE:
+                if hm < t or r._done(ds, phase):
+                    continue
+                try:
+                    if phase == "collect":
+                        res, uni = pykrx_source.fetch_day(d)
+                        r.store.ingest(res)
+                        if uni:
+                            r.store.upsert_universe_seen(uni, ds)
+                        if res.status != "ok":
+                            r.event("error", "data", f"{ds} 수집 {res.status}: {res.message}", needs_action=True)
+                        r._mark_done(ds, phase)
+                        print(f"{now:%H:%M} collect [{res.status}] {res.message}")
+                        continue
+                    rep = r.run_sync(ds, phase[5:]) if phase.startswith("sync_") else getattr(r, f"run_{phase}")(ds)
                     print(f"{now:%H:%M} {phase}: {rep.actions} {rep.blocked}")
-        time.sleep(30)
+                except Exception as e:   # 한 단계 실패가 스케줄러 전체를 멈추지 않게 하되, 조치 필요로 남긴다
+                    r.event("error", "scheduler", f"{phase} 실패: {type(e).__name__}: {e}", needs_action=True)
+                    print(f"{now:%H:%M} {phase} 실패: {type(e).__name__}: {e}")
+                    r._mark_done(ds, phase)
+        time.sleep(20)
 
 
 def cmd_dashboard(a):
@@ -215,6 +254,80 @@ def cmd_resume(a):
     s = _settings(a)
     con = connect(s.db_path)
     print(RiskManager(con, s.risk).resume())
+
+
+def cmd_kis_verify(a):
+    """한투 모의투자 연동을 단계별로 실제 호출해 검증하고 결과를 DB에 기록한다.
+    주문 검증은 삼성전자 1주를 하한가 지정가로 매수(체결되지 않을 가격) -> 조회 -> 취소 -> 조회 순서로 한다."""
+    from datetime import datetime
+    from .broker.kis import KISBroker
+    from .broker.base import Order, OrderState
+    from .broker.ledger import OrderLedger, make_client_order_id
+    from .ops.runner import Runner
+    s = _settings(a)
+    if s.mode != RunMode.KIS_VTS:
+        s = Settings(**{**s.to_dict(), "mode": "kis_vts"})
+    con = connect(s.db_path)
+    results: dict[str, str] = {}
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    def step(name, fn):
+        try:
+            out = fn()
+            results[name] = f"verified({stamp})"
+            print(f"[OK]   {name}: {out}")
+            return out
+        except Exception as e:
+            results[name] = f"failed({stamp}): {type(e).__name__}: {str(e)[:120]}"
+            print(f"[FAIL] {name}: {type(e).__name__}: {e}")
+            return None
+
+    try:
+        b = KISBroker()
+    except Exception as e:
+        print(f"[FAIL] 초기화: {e}")
+        return
+    step("token", lambda: "발급됨" if b._get_token() else "없음")
+    acct = step("account", lambda: b.account())
+    if acct:
+        print(f"       예수금 {acct.cash:,.0f} / 주문가능 {acct.orderable_cash:,.0f} / 보유 {len(acct.positions)}종목")
+        results["orderable"] = results["account"]
+    q = step("quote", lambda: b.quote("005930", date.today().isoformat()))
+    if a.with_order:
+        hm = datetime.now().strftime("%H:%M")
+        if not ("09:00" <= hm <= "15:15") or not TradingCalendar.load(a.calendar).is_trading_day(date.today()):
+            print("[SKIP] 주문 검증은 거래일 09:00~15:15에만 실행합니다.")
+        elif q and q.ref_price:
+            from .broker.base import tick_floor
+            ledger = OrderLedger(con, "kis_vts_verify")
+            low = tick_floor(q.ref_price * 0.71) + 0   # 하한가(-30%) 근처: 체결되지 않을 가격
+            o = Order(make_client_order_id("kis_vts_verify", "005930", "buy", "verify", datetime.now().isoformat()), "005930", "buy", 1, "limit", "verify",
+                      f"{date.today()} verify", limit_price=low, reason="연동 검증용 주문(체결되지 않을 가격)")
+            o = step("submit", lambda: ledger.submit(b, o))
+            if o and o.state in (OrderState.SUBMITTED, OrderState.UNFILLED):
+                results["submit"] = f"verified({stamp})"
+                o = step("query", lambda: ledger.resolve(b, o))
+                if o:
+                    print(f"       조회 상태: {o.state.value}, 주문번호 {o.broker_order_id}")
+                    step("cancel", lambda: ledger.apply(o, b.cancel(o)))
+                    o2 = ledger.resolve(b, o)
+                    print(f"       취소 후 상태: {o2.state.value}")
+                    if o2.state != OrderState.CANCELLED:
+                        results["cancel"] = f"failed({stamp}): 취소 후 상태 {o2.state.value} — 증권사 화면에서 확인 필요"
+                        print("[WARN] 취소 완료가 확인되지 않았습니다. 증권사 모의투자 화면에서 주문을 직접 확인하세요.")
+            elif o:
+                results["submit"] = f"failed({stamp}): 상태 {o.state.value} {o.error}"
+                print(f"[FAIL] submit: 상태 {o.state.value} {o.error}")
+    else:
+        print("[SKIP] 주문·조회·취소 검증은 --with-order 옵션으로 장중에 실행하세요.")
+    prev = {}
+    r = con.execute("SELECT value FROM ops_state WHERE key='kis_verification'").fetchone()
+    if r:
+        prev = json.loads(r[0])
+    prev.update(results)
+    con.execute("INSERT OR REPLACE INTO ops_state(key,value,updated_at) VALUES ('kis_verification',?,?)", (json.dumps(prev, ensure_ascii=False), stamp))
+    con.commit()
+    print("\n기능별 검증 기록:", json.dumps(prev, ensure_ascii=False, indent=1))
 
 
 def cmd_kis_check(a):
@@ -241,14 +354,16 @@ def main(argv=None):
     p.add_argument("--config", default="config.json")
     p.add_argument("--db")
     p.add_argument("--mode", choices=[m.value for m in RunMode if m != RunMode.REAL])
+    p.add_argument("--calendar", default="calendar/krx_holidays.csv", help="휴장일 CSV (date,kind,note)")
     sp = p.add_subparsers(dest="cmd", required=True)
 
     x = sp.add_parser("init-config"); x.add_argument("--path", default="config.json"); x.set_defaults(fn=cmd_init_config)
     x = sp.add_parser("synth", help="합성 데이터 생성"); x.add_argument("--start", required=True); x.add_argument("--end", required=True)
     x.add_argument("--codes", type=int, default=30); x.add_argument("--seed", type=int, default=42); x.add_argument("--flow-effect", type=float, default=0.0)
-    x.add_argument("--inject-issues", action="store_true"); x.add_argument("--calendar"); x.set_defaults(fn=cmd_synth)
+    x.add_argument("--inject-issues", action="store_true"); x.set_defaults(fn=cmd_synth)
     x = sp.add_parser("import-csv"); x.add_argument("--bars", required=True); x.add_argument("--flows"); x.set_defaults(fn=cmd_import_csv)
-    x = sp.add_parser("collect-pykrx", help="[미검증] pykrx로 실제 데이터 수집"); x.add_argument("--start", required=True); x.add_argument("--end", required=True); x.add_argument("--codes", required=True); x.set_defaults(fn=cmd_collect_pykrx)
+    x = sp.add_parser("collect-pykrx", help="[미검증] KRX 날짜별 전종목 시세·수급 수집 (KRX_ID/KRX_PW 필요)"); x.add_argument("--start", required=True); x.add_argument("--end", required=True)
+    x.add_argument("--pause", type=float, default=1.0, help="날짜 사이 대기(초)"); x.set_defaults(fn=cmd_collect_pykrx)
     x = sp.add_parser("quality"); x.set_defaults(fn=cmd_quality)
     for name, fn in (("backtest", cmd_backtest), ("compare", cmd_compare)):
         x = sp.add_parser(name); x.add_argument("--start", required=True); x.add_argument("--end", required=True)
@@ -259,12 +374,13 @@ def main(argv=None):
             x.add_argument("--split", help="학습/검증 분리 일자")
         x.set_defaults(fn=fn)
     x = sp.add_parser("paper", help="저장 데이터로 페이퍼 모의매매 시뮬레이션"); x.add_argument("--start", required=True); x.add_argument("--end", required=True); x.add_argument("-v", "--verbose", action="store_true"); x.set_defaults(fn=cmd_paper)
-    x = sp.add_parser("phase", help="단계 1회 실행 (open|close|eod)"); x.add_argument("--phase", choices=["open", "close", "eod"], required=True); x.add_argument("--date"); x.set_defaults(fn=cmd_phase)
-    x = sp.add_parser("serve", help="[미검증] KIS 모의투자 스케줄러"); x.add_argument("--calendar"); x.set_defaults(fn=cmd_serve)
+    x = sp.add_parser("phase", help="단계 1회 실행 (open|close|eod)"); x.add_argument("--phase", choices=["open", "sync_open", "close", "sync_close", "eod"], required=True); x.add_argument("--date"); x.set_defaults(fn=cmd_phase)
+    x = sp.add_parser("serve", help="[미검증] KIS 모의투자 스케줄러"); x.set_defaults(fn=cmd_serve)
     x = sp.add_parser("dashboard"); x.add_argument("--port", type=int); x.add_argument("--out", default="results"); x.set_defaults(fn=cmd_dashboard)
     x = sp.add_parser("halt"); x.add_argument("--reason", default="사용자 수동 중단"); x.set_defaults(fn=cmd_halt)
     x = sp.add_parser("resume"); x.set_defaults(fn=cmd_resume)
     x = sp.add_parser("kis-check", help="[미검증] KIS 모의투자 접속 확인"); x.set_defaults(fn=cmd_kis_check)
+    x = sp.add_parser("kis-verify", help="KIS 모의투자 기능별 실제 호출 검증 및 기록"); x.add_argument("--with-order", action="store_true", help="장중 체결되지 않을 가격으로 1주 주문->조회->취소"); x.set_defaults(fn=cmd_kis_verify)
 
     a = p.parse_args(argv)
     try:

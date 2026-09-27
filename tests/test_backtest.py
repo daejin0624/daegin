@@ -63,9 +63,11 @@ def test_exit_blocked_when_halted_then_retried():
     from krflow.data.models import Flow
     days = store.dates()
     # 종목1이 36일째 신호 -> 37일 매수 -> 41일 청산 예정(정지) -> 43일 청산
+    for d in days[28:34]:   # 주입한 신호 이전에는 자연 발생 신호가 없도록 기관 순매도
+        store.upsert_flows([Flow("900001", d, -1e9, 1e9, 0, "KRW", True, "t", d, "x", f"{d} 18:00:00")])
     for d in days[34:37]:
         store.upsert_flows([Flow("900001", d, 1e9, 1e9, 0, "KRW", True, "t", d, "x", f"{d} 18:00:00")])
-    s = _settings(max_positions=1)
+    s = _settings(max_positions=10)   # 다른 종목이 자리를 차지하지 않도록
     r = run_backtest(store, s, days[30], days[60])
     t = next(t for t in r.trades if t.code == "900001")
     assert t.entry_date == days[37] and t.planned_exit_date == days[41]
@@ -85,3 +87,17 @@ def test_compare_variants_and_effects():
     out = compare_strategies(store, _settings(), "2024-02-01", "2024-12-31")
     assert set(out["_effects"]) == {"foreign_condition_effect", "rank_inst_sum_effect", "rank_foreign_net_effect"}
     assert out["_benchmark"]["return"] is not None
+
+
+def test_backtest_skips_gap_up_beyond_limit():
+    con, store = synth_db(codes=3, seed=21)
+    from krflow.data.models import Flow
+    days = store.dates()
+    for d in days[7:10]:
+        store.upsert_flows([Flow("900000", d, 1e10, 1e10, 0, "KRW", True, "t", d, "x", f"{d} 18:00:00")])
+    c = store.bar("900000", days[9])["close"]
+    con.execute("UPDATE daily_bars SET open=?, high=? WHERE code='900000' AND date=?", (c * 1.10, c * 1.12, days[10]))
+    con.commit()
+    r = run_backtest(store, _settings(), days[9], days[30])   # 신호일부터 시작 -> 이전 보유 없음
+    assert not [t for t in r.trades if t.code == "900000" and t.entry_date == days[10]]
+    assert any(x["code"] == "900000" and "갭" in x["why"] for x in r.skipped)

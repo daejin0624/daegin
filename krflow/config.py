@@ -34,6 +34,9 @@ class StrategyParams:
     hold_days: int = 5                 # 매수일 포함 N번째 거래일 종가 매도
     rank_by: str = "inst_sum_ratio"    # inst_sum_ratio | inst_sum | foreign_net
     min_trading_value: float = 1e9     # 신호일 최소 거래대금 (원)
+    # 매수는 '신호일 종가 x (1+이 값)' 지정가로 장전 동시호가에 낸다. 시가가 이보다 높으면(갭 상승) 매수하지 않는다.
+    # 주문 시점에 시가를 알 수 없으므로 건별 매수 한도를 지키기 위한 장치. 백테스트에도 같은 규칙이 적용된다.
+    entry_limit_buffer: float = 0.05
 
 
 @dataclass

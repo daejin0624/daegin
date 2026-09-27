@@ -116,3 +116,76 @@ def test_pending_buys_count_toward_limits():
     assert not d.allow_new_buys
     qty, why = rm.buy_qty(10_000, orderable_cash=1_500_000, pending_buy_amount=1_000_000, daily_bought=0, commission_rate=0.00015)
     assert qty == 49 and why is None
+
+
+def _force_signal(store, code, days):
+    from krflow.data.models import Flow
+    for d in days:
+        store.upsert_flows([Flow(code, d, 1e10, 1e10, 0, "KRW", True, "t", d, "x", f"{d} 18:00:00")])
+
+
+def test_gap_up_limit_entry_is_cancelled_at_sync():
+    con, store = synth_db(codes=3, seed=21)
+    runner, broker = _runner(con, store)
+    days = store.dates()
+    _force_signal(store, "900000", days[7:10])
+    # 매수일 시가를 신호일 종가 대비 +10%로 만든다 (지정가 한도 +5% 초과)
+    sig_close = store.bar("900000", days[9])["close"]
+    con.execute("UPDATE daily_bars SET open=?, high=? WHERE code='900000' AND date=?", (sig_close * 1.10, sig_close * 1.12, days[10]))
+    con.commit()
+    runner.run_eod(days[9])
+    rep = runner.run_open(days[10])
+    o = [x for x in runner.ledger.all_orders() if x["code"] == "900000"][0]
+    assert o["state"] == "unfilled" and o["order_type"] == "limit" and o["limit_price"] <= sig_close * 1.05
+    rep = runner.run_sync(days[10], "open")
+    assert runner.ledger.get(o["client_order_id"]).state == OrderState.CANCELLED
+    assert not con.execute("SELECT 1 FROM positions WHERE code='900000'").fetchone()
+    assert any("갭" in a for a in rep.actions)
+
+
+def test_entry_sized_on_limit_price_within_budget():
+    con, store = synth_db(codes=10, seed=4)
+    runner, broker = _runner(con, store, budget_per_trade=700_000)
+    days = store.dates()
+    runner.simulate(days[5], days[40])
+    for r in con.execute("SELECT qty, limit_price, avg_price FROM orders WHERE side='buy' AND state='filled'"):
+        assert r["qty"] * r["limit_price"] <= 700_000
+        assert r["avg_price"] <= r["limit_price"] * (1 + runner.s.costs.slippage_rate) + 1e-6
+
+
+def test_partial_fill_then_cancel_creates_partial_position():
+    con, store = synth_db(codes=3, seed=5)
+    runner, broker = _runner(con, store)
+    d = store.dates()[10]
+    from krflow.broker.base import OrderUpdate
+    o = Order(make_client_order_id("paper", "900001", "buy", "entry", f"{d} open"), "900001", "buy", 10, "limit", "entry", f"{d} open", limit_price=1e9)
+    runner.ledger.record(o)
+    runner.ledger.apply(o, OrderUpdate(OrderState.PARTIAL, 4, 1000.0, "B1"))
+    broker._orders[o.client_order_id] = OrderUpdate(OrderState.PARTIAL, 4, 1000.0, "B1")
+    broker.positions["900001"] = (4, 1000.0)
+    runner.run_sync(d, "open")
+    p = con.execute("SELECT * FROM positions WHERE code='900001'").fetchone()
+    assert p is not None and p["qty"] == 4
+    assert runner.ledger.get(o.client_order_id).state == OrderState.CANCELLED
+    assert runner.unresolved_mismatches() == 0
+
+
+def test_exit_on_halted_day_is_retried_next_day():
+    con, store = synth_db(codes=3, seed=6)
+    runner, broker = _runner(con, store)
+    days = store.dates()
+    d0 = days[10]
+    exit_day = runner.cal.nth_trading_day_from(__import__("datetime").date.fromisoformat(d0), 5).isoformat()
+    con.execute("INSERT INTO positions(code,qty,avg_price,entry_date,planned_exit_date) VALUES ('900002',5,1000,?,?)", (d0, exit_day))
+    con.commit()
+    broker.positions["900002"] = (5, 1000.0)
+    con.execute("UPDATE daily_bars SET halted=1, open=NULL, open_tradable=0, close_tradable=0 WHERE code='900002' AND date=?", (exit_day,))
+    con.commit()
+    rep = runner.run_close(exit_day)
+    assert any("거래정지" in b for b in rep.blocked)
+    assert con.execute("SELECT exit_state FROM positions WHERE code='900002'").fetchone()[0] == "exit_blocked"
+    nxt = days[days.index(exit_day) + 1]
+    runner.run_close(nxt)
+    assert con.execute("SELECT 1 FROM positions WHERE code='900002'").fetchone() is None
+    c = con.execute("SELECT * FROM closed_positions WHERE code='900002'").fetchone()
+    assert c["exit_date"] == nxt and "대신" in c["note"]

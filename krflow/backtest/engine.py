@@ -15,6 +15,7 @@ from ..config import Settings
 from ..data.store import MarketStore
 from ..data.quality import blocked_codes
 from ..strategy.signal import compute_candidates, Candidate
+from ..broker.base import tick_floor
 
 
 @dataclass
@@ -113,8 +114,16 @@ def run_backtest(store: MarketStore, settings: Settings, start: str, end: str,
                 elif daily_bought + risk.budget_per_trade > risk.max_daily_buy:
                     why = f"일별 매수 한도 {risk.max_daily_buy:,.0f} 도달"
                 if why is None:
+                    # 실전과 같은 규칙: 신호일 종가 x (1+entry_limit_buffer) 지정가, 수량도 지정가로 계산
+                    ref = store.bar(c.code, sig)
+                    limit_px = tick_floor(ref["close"] * (1 + p.entry_limit_buffer)) if ref is not None and ref["close"] else None
+                    if limit_px is None:
+                        why = "신호일 종가 없음"
+                    elif b["open"] > limit_px:
+                        why = f"시가 갭 {b['open'] / ref['close'] - 1:+.1%} > 지정가 한도 {p.entry_limit_buffer:+.0%} (미체결)"
+                if why is None:
                     px = b["open"] * (1 + costs.slippage_rate)
-                    qty = math.floor(min(risk.budget_per_trade, cash / (1 + costs.commission_rate)) / px)
+                    qty = math.floor(min(risk.budget_per_trade, cash / (1 + costs.commission_rate)) / limit_px)
                     if qty <= 0:
                         why = "현금 부족 또는 1주 미만"
                 if why is not None:

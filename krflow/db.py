@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS investor_flows (
     revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (code, date)
 );
+CREATE INDEX IF NOT EXISTS idx_bars_date ON daily_bars(date);
+CREATE INDEX IF NOT EXISTS idx_flows_date ON investor_flows(date);
 CREATE TABLE IF NOT EXISTS corporate_actions (
     code TEXT NOT NULL, date TEXT NOT NULL, kind TEXT NOT NULL,   -- split|merge|dividend|other
     ratio REAL NOT NULL DEFAULT 1.0, note TEXT,
